@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from io import BytesIO
 
@@ -16,6 +17,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    ReplyParameters,
 )
 
 from .agents import AgentRunner
@@ -95,6 +97,34 @@ async def send_long(bot: Bot, chat_id: int, text: str) -> None:
         await bot.send_message(chat_id, chunk)
 
 
+# разрешённые теги Telegram-агента; всё остальное экранируется
+_TG_TAG = re.compile(r"(</?(?:b|blockquote)>)")
+_BARE_AMP = re.compile(r"&(?!(?:amp|lt|gt|quot|#\d+);)")
+
+
+def sanitize_telegram_html(text: str) -> str:
+    """Экранирует голые <, >, & вне тегов <b> и <blockquote>."""
+    parts = _TG_TAG.split(text)
+    result = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:  # сам тег - не трогаем
+            result.append(part)
+        else:
+            part = _BARE_AMP.sub("&amp;", part)
+            result.append(part.replace("<", "&lt;").replace(">", "&gt;"))
+    return "".join(result)
+
+
+async def send_telegram_html(bot: Bot, chat_id: int, text: str) -> None:
+    """Отправка с parse_mode=HTML; при битой разметке - откат на простой текст."""
+    for chunk in split_message(text):
+        try:
+            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+        except TelegramBadRequest:
+            logger.warning("HTML-разметка не прошла, отправляю как простой текст")
+            await bot.send_message(chat_id, chunk)
+
+
 async def _transcribe_item(ctx: AppContext, item: BufferedItem, file_id: str, filename: str) -> None:
     try:
         buffer = BytesIO()
@@ -172,25 +202,58 @@ async def _run_series(ctx: AppContext, chat_id: int) -> None:
     await _send_result(ctx, chat_id, result)
 
 
-def _format_material(material: ChannelMaterial) -> str:
-    lines = [material.label]
-    if material.editor_status == "НА ПРАВКУ":
-        lines[0] += " (после правки редактора)"
-    lines.append("")
+async def _send_telegram_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:
+    text = f"{material.label}\n\n{sanitize_telegram_html(material.body)}"
+    await send_telegram_html(ctx.bot, chat_id, text)
+
+
+async def _send_vcru_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:
+    lines = [material.label, ""]
     if material.title:
-        lines.append(f"Заголовок: {material.title}")
-    if material.preview:
-        lines.append(f"Описание для превью: {material.preview}")
-    if material.title or material.preview:
-        lines.append("")
+        lines += [f"Заголовок: {material.title}", ""]
     lines.append(material.body)
-    return "\n".join(lines)
+    await send_long(ctx.bot, chat_id, "\n".join(lines))
+
+
+async def _send_threads_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:
+    """Постит цепочкой: первый пост, остальные - ответами в тред."""
+    posts = material.posts or [material.body]
+    first = await ctx.bot.send_message(
+        chat_id, f"{material.label} - цепочка из {len(posts)}\n\n{posts[0]}"
+    )
+    previous_id = first.message_id
+    for post in posts[1:]:
+        message = await ctx.bot.send_message(
+            chat_id,
+            post,
+            reply_parameters=ReplyParameters(message_id=previous_id),
+        )
+        previous_id = message.message_id
+
+    overlong = material.overlong_posts()
+    if overlong:
+        numbers = ", ".join(str(n) for n in overlong)
+        await ctx.bot.send_message(
+            chat_id,
+            f"Внимание: в Threads посты {numbers} длиннее 500 знаков - сократи перед публикацией.",
+        )
 
 
 async def _send_result(ctx: AppContext, chat_id: int, result: PipelineResult) -> None:
     # Мастер-бриф - внутренний рабочий документ, в чат не отправляется.
+    senders = {
+        "telegram": _send_telegram_material,
+        "vcru": _send_vcru_material,
+        "threads": _send_threads_material,
+    }
     for material in result.materials:
-        await send_long(ctx.bot, chat_id, _format_material(material))
+        await senders[material.channel](ctx, chat_id, material)
+        if material.editor_status == "НА ПРАВКУ" and material.editor_issues:
+            await send_long(
+                ctx.bot,
+                chat_id,
+                f"Редактор про {material.label} - НА ПРАВКУ:\n{material.editor_issues}",
+            )
 
     if result.gaps:
         await send_long(ctx.bot, chat_id, "Проверь перед публикацией:\n\n" + result.gaps)
@@ -202,8 +265,8 @@ async def handle_start(message: Message, ctx: AppContext) -> None:
         return
     await message.answer(
         "Пришлите голосовое (можно несколько подряд) или текст с идеей.\n"
-        "Я подожду 20 секунд после последнего сообщения и пришлю четыре текста - "
-        "Telegram, VK, Дзен, vc.ru.\n"
+        "Я подожду 20 секунд после последнего сообщения и пришлю три текста - "
+        "Telegram, vc.ru и цепочку для Threads.\n"
         "Чтобы не ждать, нажмите кнопку Собрать бриф."
     )
 

@@ -1,4 +1,10 @@
-"""Вызовы Claude API: парсер, четыре канальных агента, редактор."""
+"""Вызовы Claude API: парсер, три канальных агента, редактор.
+
+Модели: канальные агенты - sonnet (важен голос), парсер и редактор - haiku
+(извлечение и проверка, дешевле). Статичные системные промпты помечены
+cache_control - повторные вызовы идут по кэш-цене; меняющийся мастер-бриф
+передаётся в user-сообщении и в кэш не попадает.
+"""
 
 import logging
 import re
@@ -11,23 +17,23 @@ from .prompts import build_system_prompt
 
 logger = logging.getLogger(__name__)
 
-CHANNEL_ORDER = ("telegram", "vk", "dzen", "vcru")
+CHANNEL_ORDER = ("telegram", "vcru", "threads")
 
 CHANNEL_LABELS = {
     "telegram": "Telegram",
-    "vk": "VK",
-    "dzen": "Дзен",
     "vcru": "vc.ru",
+    "threads": "Threads",
 }
 
-MAX_OUTPUT_TOKENS = 8000
+CHANNEL_MAX_TOKENS = 8000
+PARSER_MAX_TOKENS = 4000
+EDITOR_MAX_TOKENS = 1500
 
 
 @dataclass
 class EditorVerdict:
-    status: str          # "OK" или "НА ПРАВКУ"
-    issues: str          # список несоответствий (текстом)
-    fixed_text: str | None  # исправленный текст, если был
+    status: str   # "OK" или "НА ПРАВКУ"
+    issues: str   # список "ЧТО НЕ ТАК" (текстом, пусто при OK)
 
 
 class AgentRunner:
@@ -39,13 +45,36 @@ class AgentRunner:
             max_retries=3,
         )
 
-    async def _call(self, system: str, user_content: str, temperature: float) -> str:
+    async def _call(
+        self,
+        model: str,
+        system: str,
+        user_content: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
         response = await self._client.messages.create(
-            model=self._settings.model,
-            max_tokens=MAX_OUTPUT_TOKENS,
+            model=model,
+            max_tokens=max_tokens,
             temperature=temperature,
-            system=system,
+            # системный промпт статичен между вызовами - кэшируем целиком
+            system=[
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             messages=[{"role": "user", "content": user_content}],
+        )
+        usage = response.usage
+        logger.info(
+            "Модель %s: вход %d, из кэша %d, в кэш %d, выход %d токенов",
+            model,
+            usage.input_tokens,
+            usage.cache_read_input_tokens or 0,
+            usage.cache_creation_input_tokens or 0,
+            usage.output_tokens,
         )
         text = "".join(
             block.text for block in response.content if block.type == "text"
@@ -56,13 +85,25 @@ class AgentRunner:
 
     async def build_brief(self, source_text: str) -> str:
         logger.info("Парсер: собираю мастер-бриф")
-        brief = await self._call(build_system_prompt("parser"), source_text, self._settings.parser_temperature)
+        brief = await self._call(
+            self._settings.fast_model,
+            build_system_prompt("parser"),
+            source_text,
+            self._settings.parser_temperature,
+            PARSER_MAX_TOKENS,
+        )
         logger.info("Парсер: бриф собран, %d знаков", len(brief))
         return brief
 
     async def write_channel(self, channel: str, brief: str) -> str:
         logger.info("Канальный агент %s: пишу текст", channel)
-        text = await self._call(build_system_prompt(channel), brief, self._settings.channel_temperature)
+        text = await self._call(
+            self._settings.model,
+            build_system_prompt(channel),
+            brief,
+            self._settings.channel_temperature,
+            CHANNEL_MAX_TOKENS,
+        )
         logger.info("Канальный агент %s: готово, %d знаков", channel, len(text))
         return text
 
@@ -73,7 +114,13 @@ class AgentRunner:
             f"КАНАЛ: {CHANNEL_LABELS[channel]}\n\n"
             f"ТЕКСТ КАНАЛА:\n{text}"
         )
-        raw = await self._call(build_system_prompt("editor"), user_content, self._settings.editor_temperature)
+        raw = await self._call(
+            self._settings.fast_model,
+            build_system_prompt("editor"),
+            user_content,
+            self._settings.editor_temperature,
+            EDITOR_MAX_TOKENS,
+        )
         verdict = parse_editor_output(raw)
         logger.info("Редактор: %s - статус %s", channel, verdict.status)
         return verdict
@@ -86,18 +133,8 @@ def parse_editor_output(raw: str) -> EditorVerdict:
         status = "НА ПРАВКУ"
 
     issues = ""
-    issues_match = re.search(
-        r"НЕСООТВЕТСТВИЯ:\s*(.*?)(?=ИСПРАВЛЕННЫЙ ТЕКСТ:|\Z)", raw, re.DOTALL
-    )
+    issues_match = re.search(r"ЧТО НЕ ТАК:\s*(.*)\Z", raw, re.DOTALL)
     if issues_match:
         issues = issues_match.group(1).strip()
 
-    fixed_text = None
-    fixed_match = re.search(r"ИСПРАВЛЕННЫЙ ТЕКСТ:\s*\n?(.*)", raw, re.DOTALL)
-    if fixed_match:
-        candidate = fixed_match.group(1).strip()
-        # отсекаем ответы вида "не требуется", "-" и т.п.
-        if len(candidate) > 200:
-            fixed_text = candidate
-
-    return EditorVerdict(status=status, issues=issues, fixed_text=fixed_text)
+    return EditorVerdict(status=status, issues=issues)

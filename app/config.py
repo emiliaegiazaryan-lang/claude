@@ -13,7 +13,8 @@ class Settings:
     telegram_bot_token: str
     anthropic_api_key: str
     openai_api_key: str
-    model: str
+    model: str        # канальные агенты (Telegram, vc.ru, Threads)
+    fast_model: str   # парсер и редактор
     parser_temperature: float
     channel_temperature: float
     editor_temperature: float
@@ -36,6 +37,7 @@ def load_settings() -> Settings:
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
         model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip(),
+        fast_model=os.getenv("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5").strip(),
         parser_temperature=float(os.getenv("PARSER_TEMPERATURE", "0.2")),
         channel_temperature=float(os.getenv("CHANNEL_TEMPERATURE", "0.6")),
         editor_temperature=float(os.getenv("EDITOR_TEMPERATURE", "0.2")),

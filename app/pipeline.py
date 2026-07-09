@@ -1,13 +1,16 @@
-"""Оркестрация пайплайна: вход -> мастер-бриф -> 4 текста -> проверка редактором."""
+"""Оркестрация пайплайна: вход -> мастер-бриф -> 3 текста -> чистка -> редактор."""
 
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .agents import CHANNEL_LABELS, CHANNEL_ORDER, AgentRunner
+from .cleanup import mechanical_cleanup
 
 logger = logging.getLogger(__name__)
+
+THREADS_POST_LIMIT = 500
 
 
 @dataclass
@@ -15,10 +18,17 @@ class ChannelMaterial:
     channel: str
     label: str
     title: str | None
-    preview: str | None
     body: str
-    editor_status: str
-    editor_issues: str
+    posts: list[str] = field(default_factory=list)  # только для Threads
+    editor_status: str = "OK"
+    editor_issues: str = ""
+
+    def overlong_posts(self) -> list[int]:
+        """Номера постов Threads, превысивших лимит 500 знаков (нумерация с 1)."""
+        return [
+            i for i, post in enumerate(self.posts, start=1)
+            if len(post) > THREADS_POST_LIMIT
+        ]
 
 
 @dataclass
@@ -37,62 +47,77 @@ def extract_gaps(brief: str) -> str | None:
     return gaps or None
 
 
-def split_title(channel: str, text: str) -> tuple[str | None, str | None, str]:
-    """Выносит ЗАГОЛОВОК (и ОПИСАНИЕ ДЛЯ ПРЕВЬЮ у Дзена) из текста Дзена и vc.ru."""
-    if channel not in ("dzen", "vcru"):
-        return None, None, text
+def split_title(channel: str, text: str) -> tuple[str | None, str]:
+    """Выносит строку ЗАГОЛОВОК из текста vc.ru."""
+    if channel != "vcru":
+        return None, text
 
     title = None
-    preview = None
     body_lines = []
     for line in text.splitlines():
-        stripped = line.strip()
-        title_match = re.match(r"ЗАГОЛОВОК:\s*(.*)", stripped)
-        preview_match = re.match(r"ОПИСАНИЕ ДЛЯ ПРЕВЬЮ:\s*(.*)", stripped)
+        title_match = re.match(r"ЗАГОЛОВОК:\s*(.*)", line.strip())
         if title is None and title_match:
             title = title_match.group(1).strip() or None
             continue
-        if channel == "dzen" and preview is None and preview_match:
-            preview = preview_match.group(1).strip() or None
-            continue
         body_lines.append(line)
     body = "\n".join(body_lines).strip()
-    return title, preview, body or text
+    return title, body or text
+
+
+_THREADS_POST_LABEL = re.compile(r"\AПост\s*\d+\s*[-:.–—]?[^\n]*\n+", re.IGNORECASE)
+
+
+def split_threads_posts(text: str) -> list[str]:
+    """Режет вывод Threads-агента на посты по строке-разделителю ---.
+
+    Служебные метки вида "Пост 1 - крючок" в начале поста снимаются:
+    это подпись из промпта, в публикацию она идти не должна.
+    """
+    posts = re.split(r"\n\s*-{3,}\s*\n", "\n" + text + "\n")
+    cleaned = []
+    for post in posts:
+        post = post.strip()
+        if not post:
+            continue
+        cleaned.append(_THREADS_POST_LABEL.sub("", post).strip())
+    return cleaned
 
 
 async def run_pipeline(runner: AgentRunner, source_text: str) -> PipelineResult:
     brief = await runner.build_brief(source_text)
 
-    logger.info("Запускаю 4 канальных агента параллельно")
+    logger.info("Запускаю %d канальных агента параллельно", len(CHANNEL_ORDER))
     drafts = await asyncio.gather(
         *(runner.write_channel(channel, brief) for channel in CHANNEL_ORDER)
     )
 
+    # механическая чистка до редактора: тире, восклицания, эмодзи
+    cleaned = [mechanical_cleanup(draft) for draft in drafts]
+    logger.info("Механическая чистка выполнена")
+
     logger.info("Прогоняю тексты через редактора")
     verdicts = await asyncio.gather(
         *(
-            runner.review(channel, brief, draft)
-            for channel, draft in zip(CHANNEL_ORDER, drafts)
+            runner.review(channel, brief, text)
+            for channel, text in zip(CHANNEL_ORDER, cleaned)
         )
     )
 
     materials = []
-    for channel, draft, verdict in zip(CHANNEL_ORDER, drafts, verdicts):
-        final_text = draft
-        if verdict.status == "НА ПРАВКУ" and verdict.fixed_text:
-            final_text = verdict.fixed_text
-        title, preview, body = split_title(channel, final_text)
+    for channel, text, verdict in zip(CHANNEL_ORDER, cleaned, verdicts):
+        title, body = split_title(channel, text)
+        posts = split_threads_posts(body) if channel == "threads" else []
         materials.append(
             ChannelMaterial(
                 channel=channel,
                 label=CHANNEL_LABELS[channel],
                 title=title,
-                preview=preview,
                 body=body,
+                posts=posts,
                 editor_status=verdict.status,
                 editor_issues=verdict.issues,
             )
         )
 
-    logger.info("Пайплайн завершён: 4 текста готовы")
+    logger.info("Пайплайн завершён: %d текста готовы", len(materials))
     return PipelineResult(brief=brief, gaps=extract_gaps(brief), materials=materials)

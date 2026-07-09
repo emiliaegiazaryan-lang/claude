@@ -16,9 +16,8 @@ PROMPT_COMPOSITION: dict[str, tuple[str, ...]] = {
     "parser": ("parser",),
     "editor": ("editor",),
     "telegram": ("style_card", "etalons_telegram", "telegram"),
-    "vk": ("style_card", "vk"),
-    "dzen": ("style_card", "dzen"),
     "vcru": ("style_card", "format_vcru", "etalons_vcru", "vcru"),
+    "threads": ("style_card", "threads"),
 }
 
 BLOCK_SEPARATOR = "\n\n---\n\n"

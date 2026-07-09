@@ -43,14 +43,18 @@ async def _main(topic: str) -> None:
         print(SEPARATOR)
         if material.title:
             print(f"Заголовок: {material.title}")
-        if material.preview:
-            print(f"Описание для превью: {material.preview}")
-        if material.title or material.preview:
             print()
-        print(material.body)
+        if material.posts:
+            for i, post in enumerate(material.posts, start=1):
+                marker = " - ДЛИННЕЕ 500" if len(post) > 500 else ""
+                print(f"--- пост {i} ({len(post)} знаков{marker}) ---")
+                print(post)
+                print()
+        else:
+            print(material.body)
         if material.editor_status == "НА ПРАВКУ" and material.editor_issues:
             print()
-            print(f"Замечания редактора:\n{material.editor_issues}")
+            print(f"Редактор - что не так:\n{material.editor_issues}")
 
 
 def main() -> None:

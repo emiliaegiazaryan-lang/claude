@@ -29,10 +29,11 @@ class PipelineResult:
 
 
 def extract_gaps(brief: str) -> str | None:
-    match = re.search(r"ПРОБЕЛЫ:?\s*\n?(.+)\Z", brief, re.DOTALL)
+    match = re.search(r"ПРОБЕЛЫ[:*]*\s*\n?(.+)\Z", brief, re.DOTALL)
     if not match:
         return None
-    gaps = match.group(1).strip()
+    # убираем markdown-обрамление вокруг заголовка секции, если модель его добавила
+    gaps = match.group(1).strip().lstrip("*: \n").strip()
     return gaps or None
 
 

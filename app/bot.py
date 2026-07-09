@@ -188,19 +188,12 @@ def _format_material(material: ChannelMaterial) -> str:
 
 
 async def _send_result(ctx: AppContext, chat_id: int, result: PipelineResult) -> None:
-    await send_long(ctx.bot, chat_id, "Мастер-бриф\n\n" + result.brief)
-
-    if result.gaps:
-        await send_long(
-            ctx.bot,
-            chat_id,
-            "Проверь перед публикацией - в брифе есть пробелы:\n\n" + result.gaps,
-        )
-
+    # Мастер-бриф - внутренний рабочий документ, в чат не отправляется.
     for material in result.materials:
         await send_long(ctx.bot, chat_id, _format_material(material))
 
-    await ctx.bot.send_message(chat_id, "Готово. Четыре материала и бриф выше.")
+    if result.gaps:
+        await send_long(ctx.bot, chat_id, "Проверь перед публикацией:\n\n" + result.gaps)
 
 
 @router.message(CommandStart())
@@ -209,8 +202,8 @@ async def handle_start(message: Message, ctx: AppContext) -> None:
         return
     await message.answer(
         "Пришлите голосовое (можно несколько подряд) или текст с идеей.\n"
-        "Я подожду 20 секунд после последнего сообщения и соберу: "
-        "мастер-бриф и четыре текста - Telegram, VK, Дзен, vc.ru.\n"
+        "Я подожду 20 секунд после последнего сообщения и пришлю четыре текста - "
+        "Telegram, VK, Дзен, vc.ru.\n"
         "Чтобы не ждать, нажмите кнопку Собрать бриф."
     )
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import anthropic
 
 from .config import Settings
-from .prompts import load_prompt
+from .prompts import build_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +56,13 @@ class AgentRunner:
 
     async def build_brief(self, source_text: str) -> str:
         logger.info("Парсер: собираю мастер-бриф")
-        brief = await self._call(load_prompt("parser"), source_text, self._settings.parser_temperature)
+        brief = await self._call(build_system_prompt("parser"), source_text, self._settings.parser_temperature)
         logger.info("Парсер: бриф собран, %d знаков", len(brief))
         return brief
 
     async def write_channel(self, channel: str, brief: str) -> str:
         logger.info("Канальный агент %s: пишу текст", channel)
-        text = await self._call(load_prompt(channel), brief, self._settings.channel_temperature)
+        text = await self._call(build_system_prompt(channel), brief, self._settings.channel_temperature)
         logger.info("Канальный агент %s: готово, %d знаков", channel, len(text))
         return text
 
@@ -73,7 +73,7 @@ class AgentRunner:
             f"КАНАЛ: {CHANNEL_LABELS[channel]}\n\n"
             f"ТЕКСТ КАНАЛА:\n{text}"
         )
-        raw = await self._call(load_prompt("editor"), user_content, self._settings.editor_temperature)
+        raw = await self._call(build_system_prompt("editor"), user_content, self._settings.editor_temperature)
         verdict = parse_editor_output(raw)
         logger.info("Редактор: %s - статус %s", channel, verdict.status)
         return verdict

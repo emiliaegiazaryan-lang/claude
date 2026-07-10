@@ -107,6 +107,31 @@ class AgentRunner:
         logger.info("Канальный агент %s: готово, %d знаков", channel, len(text))
         return text
 
+    async def revise_channel(
+        self, channel: str, brief: str, current_text: str, feedback: str
+    ) -> str:
+        """Переделывает текст канала по правкам автора. Системный промпт тот же -
+        повторный вызов идёт по кэш-цене."""
+        logger.info("Канальный агент %s: переделываю по правкам", channel)
+        user_content = (
+            f"МАСТЕР-БРИФ:\n{brief}\n\n"
+            f"ТЕКУЩИЙ ТЕКСТ:\n{current_text}\n\n"
+            f"ПРАВКИ ОТ АВТОРА:\n{feedback}\n\n"
+            "Автор посмотрел текст и просит правки. Перепиши текст с учётом правок, "
+            "сохрани формат канала и все правила выше. Меняй только то, о чём просят, "
+            "остальное без необходимости не трогай. Выведи только готовый текст, "
+            "без комментариев и пояснений."
+        )
+        text = await self._call(
+            self._settings.model,
+            build_system_prompt(channel),
+            user_content,
+            self._settings.channel_temperature,
+            CHANNEL_MAX_TOKENS,
+        )
+        logger.info("Канальный агент %s: правка готова, %d знаков", channel, len(text))
+        return text
+
     async def review(self, channel: str, brief: str, text: str) -> EditorVerdict:
         logger.info("Редактор: проверяю текст для %s", channel)
         user_content = (

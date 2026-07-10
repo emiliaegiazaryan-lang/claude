@@ -1,5 +1,11 @@
 """Telegram-бот: принимает серию голосовых/текстов, склеивает и запускает пайплайн.
 
+Возможности:
+- серия сообщений = одна идея (дебаунс 20 секунд + кнопка "Собрать бриф");
+- выбор каналов в начале: Telegram / vc.ru / Threads / Telegram + vc.ru / все три;
+- правки: ответьте (реплаем) на присланный материал текстом или голосом -
+  бот переделает этот материал с учётом правок.
+
 Запуск: python -m app.bot
 """
 
@@ -20,9 +26,9 @@ from aiogram.types import (
     ReplyParameters,
 )
 
-from .agents import AgentRunner
+from .agents import CHANNEL_LABELS, CHANNEL_ORDER, AgentRunner
 from .config import Settings, load_settings, require
-from .pipeline import ChannelMaterial, PipelineResult, run_pipeline
+from .pipeline import ChannelMaterial, PipelineResult, revise_material, run_pipeline
 from .transcription import Transcriber
 
 logger = logging.getLogger(__name__)
@@ -30,14 +36,44 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 COLLECT_CALLBACK = "collect_brief"
+
+# варианты выбора каналов на клавиатуре
+CHANNEL_CHOICES: dict[str, tuple[str, ...]] = {
+    "ch_telegram": ("telegram",),
+    "ch_vcru": ("vcru",),
+    "ch_threads": ("threads",),
+    "ch_tg_vc": ("telegram", "vcru"),
+    "ch_all": CHANNEL_ORDER,
+}
+
 MAX_MESSAGE_LENGTH = 4000
 
-STATUS_TEXT = "Слушаю, шлите ещё или нажмите Собрать бриф"
-PROCESSING_TEXT = "Принял. Собираю бриф и тексты, обычно это занимает 1-2 минуты..."
-
-collect_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[[InlineKeyboardButton(text="Собрать бриф", callback_data=COLLECT_CALLBACK)]]
+STATUS_TEXT = (
+    "Слушаю, шлите ещё или нажмите Собрать бриф.\n"
+    "Каналы: все три. Можно выбрать другие кнопками ниже."
 )
+PROCESSING_TEXT = "Принял. Собираю бриф и тексты, обычно это занимает 1-2 минуты..."
+FEEDBACK_HINT = (
+    "Если что-то не нравится - ответьте (реплаем) на нужный материал "
+    "и напишите или наговорите правки."
+)
+
+
+def series_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Telegram", callback_data="ch_telegram"),
+                InlineKeyboardButton(text="vc.ru", callback_data="ch_vcru"),
+                InlineKeyboardButton(text="Threads", callback_data="ch_threads"),
+            ],
+            [
+                InlineKeyboardButton(text="Telegram + vc.ru", callback_data="ch_tg_vc"),
+                InlineKeyboardButton(text="Все три", callback_data="ch_all"),
+            ],
+            [InlineKeyboardButton(text="Собрать бриф", callback_data=COLLECT_CALLBACK)],
+        ]
+    )
 
 
 @dataclass
@@ -55,6 +91,16 @@ class Series:
     items: list[BufferedItem] = field(default_factory=list)
     timer: asyncio.Task | None = None
     status_message: Message | None = None
+    channels: tuple[str, ...] = CHANNEL_ORDER
+
+
+@dataclass
+class SessionState:
+    """Последняя выдача по чату - основа для правок реплаем."""
+
+    brief: str
+    materials: dict[str, ChannelMaterial] = field(default_factory=dict)
+    message_map: dict[int, str] = field(default_factory=dict)  # message_id -> канал
 
 
 class AppContext:
@@ -64,6 +110,7 @@ class AppContext:
         self.transcriber = Transcriber(settings)
         self.runner = AgentRunner(settings)
         self.series: dict[int, Series] = {}
+        self.sessions: dict[int, SessionState] = {}
 
     def is_allowed(self, user_id: int | None) -> bool:
         allowed = self.settings.allowed_user_ids
@@ -92,12 +139,11 @@ def split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
     return chunks
 
 
-async def send_long(bot: Bot, chat_id: int, text: str) -> None:
-    for chunk in split_message(text):
-        await bot.send_message(chat_id, chunk)
+async def send_long(bot: Bot, chat_id: int, text: str) -> list[Message]:
+    return [await bot.send_message(chat_id, chunk) for chunk in split_message(text)]
 
 
-# разрешённые теги Telegram-агента; всё остальное экранируется
+# разрешённые теги каналов Telegram и vc.ru; всё остальное экранируется
 _TG_TAG = re.compile(r"(</?(?:b|blockquote)>)")
 _BARE_AMP = re.compile(r"&(?!(?:amp|lt|gt|quot|#\d+);)")
 
@@ -115,14 +161,16 @@ def sanitize_telegram_html(text: str) -> str:
     return "".join(result)
 
 
-async def send_telegram_html(bot: Bot, chat_id: int, text: str) -> None:
+async def send_telegram_html(bot: Bot, chat_id: int, text: str) -> list[Message]:
     """Отправка с parse_mode=HTML; при битой разметке - откат на простой текст."""
+    messages = []
     for chunk in split_message(text):
         try:
-            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+            messages.append(await bot.send_message(chat_id, chunk, parse_mode="HTML"))
         except TelegramBadRequest:
             logger.warning("HTML-разметка не прошла, отправляю как простой текст")
-            await bot.send_message(chat_id, chunk)
+            messages.append(await bot.send_message(chat_id, chunk))
+    return messages
 
 
 async def _transcribe_item(ctx: AppContext, item: BufferedItem, file_id: str, filename: str) -> None:
@@ -133,6 +181,28 @@ async def _transcribe_item(ctx: AppContext, item: BufferedItem, file_id: str, fi
     except Exception as exc:  # noqa: BLE001 - причина уходит пользователю
         logger.exception("Транскрибация сообщения %d не удалась", item.index)
         item.error = str(exc)
+
+
+async def _extract_feedback_text(ctx: AppContext, message: Message) -> str | None:
+    """Достаёт текст правок из сообщения: текст как есть, голос - через Whisper."""
+    if message.text:
+        return message.text
+    file_id = None
+    filename = "voice.ogg"
+    if message.voice:
+        file_id = message.voice.file_id
+    elif message.audio:
+        file_id = message.audio.file_id
+        filename = message.audio.file_name or "audio.mp3"
+    if not file_id:
+        return None
+    try:
+        buffer = BytesIO()
+        await ctx.bot.download(file_id, destination=buffer)
+        return await ctx.transcriber.transcribe(buffer.getvalue(), filename)
+    except Exception:  # noqa: BLE001
+        logger.exception("Транскрибация правок не удалась")
+        return None
 
 
 def _schedule_run(ctx: AppContext, series: Series) -> None:
@@ -185,13 +255,14 @@ async def _run_series(ctx: AppContext, chat_id: int) -> None:
 
     source_text = "\n\n".join(parts)
     logger.info(
-        "Серия из %d сообщений склеена, %d знаков. Запускаю пайплайн",
+        "Серия из %d сообщений склеена, %d знаков. Каналы: %s",
         len(series.items),
         len(source_text),
+        ", ".join(series.channels),
     )
 
     try:
-        result = await run_pipeline(ctx.runner, source_text)
+        result = await run_pipeline(ctx.runner, source_text, series.channels)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Пайплайн упал")
         await ctx.bot.send_message(
@@ -202,33 +273,35 @@ async def _run_series(ctx: AppContext, chat_id: int) -> None:
     await _send_result(ctx, chat_id, result)
 
 
-async def _send_telegram_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:
+async def _send_telegram_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> list[Message]:
     text = f"{material.label}\n\n{sanitize_telegram_html(material.body)}"
-    await send_telegram_html(ctx.bot, chat_id, text)
+    return await send_telegram_html(ctx.bot, chat_id, text)
 
 
-async def _send_vcru_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:
+async def _send_vcru_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> list[Message]:
     lines = [material.label, ""]
     if material.title:
         lines += [f"Заголовок: {sanitize_telegram_html(material.title)}", ""]
     lines.append(sanitize_telegram_html(material.body))
-    await send_telegram_html(ctx.bot, chat_id, "\n".join(lines))
+    return await send_telegram_html(ctx.bot, chat_id, "\n".join(lines))
 
 
-async def _send_threads_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:
+async def _send_threads_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> list[Message]:
     """Постит цепочкой: первый пост, остальные - ответами в тред."""
     posts = material.posts or [material.body]
-    first = await ctx.bot.send_message(
-        chat_id, f"{material.label} - цепочка из {len(posts)}\n\n{posts[0]}"
-    )
-    previous_id = first.message_id
-    for post in posts[1:]:
-        message = await ctx.bot.send_message(
-            chat_id,
-            post,
-            reply_parameters=ReplyParameters(message_id=previous_id),
+    messages = [
+        await ctx.bot.send_message(
+            chat_id, f"{material.label} - цепочка из {len(posts)}\n\n{posts[0]}"
         )
-        previous_id = message.message_id
+    ]
+    for post in posts[1:]:
+        messages.append(
+            await ctx.bot.send_message(
+                chat_id,
+                post,
+                reply_parameters=ReplyParameters(message_id=messages[-1].message_id),
+            )
+        )
 
     overlong = material.overlong_posts()
     if overlong:
@@ -237,26 +310,78 @@ async def _send_threads_material(ctx: AppContext, chat_id: int, material: Channe
             chat_id,
             f"Внимание: в Threads посты {numbers} длиннее 500 знаков - сократи перед публикацией.",
         )
+    return messages
+
+
+_SENDERS = {
+    "telegram": _send_telegram_material,
+    "vcru": _send_vcru_material,
+    "threads": _send_threads_material,
+}
+
+
+async def _send_material(
+    ctx: AppContext, chat_id: int, material: ChannelMaterial, session: SessionState
+) -> None:
+    """Отправляет материал, запоминает его для правок реплаем."""
+    messages = await _SENDERS[material.channel](ctx, chat_id, material)
+    session.materials[material.channel] = material
+    for message in messages:
+        session.message_map[message.message_id] = material.channel
+
+    if material.editor_status == "НА ПРАВКУ" and material.editor_issues:
+        await send_long(
+            ctx.bot,
+            chat_id,
+            f"Редактор про {material.label} - НА ПРАВКУ:\n{material.editor_issues}",
+        )
 
 
 async def _send_result(ctx: AppContext, chat_id: int, result: PipelineResult) -> None:
     # Мастер-бриф - внутренний рабочий документ, в чат не отправляется.
-    senders = {
-        "telegram": _send_telegram_material,
-        "vcru": _send_vcru_material,
-        "threads": _send_threads_material,
-    }
+    session = SessionState(brief=result.brief)
+    ctx.sessions[chat_id] = session
+
     for material in result.materials:
-        await senders[material.channel](ctx, chat_id, material)
-        if material.editor_status == "НА ПРАВКУ" and material.editor_issues:
-            await send_long(
-                ctx.bot,
-                chat_id,
-                f"Редактор про {material.label} - НА ПРАВКУ:\n{material.editor_issues}",
-            )
+        await _send_material(ctx, chat_id, material, session)
 
     if result.gaps:
         await send_long(ctx.bot, chat_id, "Проверь перед публикацией:\n\n" + result.gaps)
+
+    await ctx.bot.send_message(chat_id, FEEDBACK_HINT)
+
+
+async def _handle_feedback(ctx: AppContext, message: Message, channel: str) -> None:
+    session = ctx.sessions.get(message.chat.id)
+    if session is None or channel not in session.materials:
+        await message.answer("Не нашёл материал для правки - пришлите идею заново.")
+        return
+
+    feedback = await _extract_feedback_text(ctx, message)
+    if not feedback:
+        await message.answer("Не смог разобрать правки - напишите текстом, что поменять.")
+        return
+
+    label = CHANNEL_LABELS[channel]
+    logger.info("Правки для %s: %d знаков", channel, len(feedback))
+    note = await message.answer(f"Переделываю {label}...")
+    try:
+        material = await revise_material(
+            ctx.runner,
+            channel,
+            session.brief,
+            session.materials[channel].raw,
+            feedback,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Правка не удалась")
+        await message.answer(f"Правка не прошла: {exc}. Попробуйте ещё раз.")
+        return
+    try:
+        await note.delete()
+    except TelegramBadRequest:
+        pass
+    await _send_material(ctx, message.chat.id, material, session)
 
 
 @router.message(CommandStart())
@@ -265,9 +390,11 @@ async def handle_start(message: Message, ctx: AppContext) -> None:
         return
     await message.answer(
         "Пришлите голосовое (можно несколько подряд) или текст с идеей.\n"
-        "Я подожду 20 секунд после последнего сообщения и пришлю три текста - "
-        "Telegram, vc.ru и цепочку для Threads.\n"
-        "Чтобы не ждать, нажмите кнопку Собрать бриф."
+        "Кнопками можно выбрать, что генерировать: Telegram, vc.ru, Threads "
+        "или комбинацию. По умолчанию - все три.\n"
+        "Я подожду 20 секунд после последнего сообщения (или нажмите Собрать бриф) "
+        "и пришлю готовые тексты.\n"
+        "Правки: ответьте (реплаем) на нужный материал текстом или голосом - переделаю."
     )
 
 
@@ -277,6 +404,14 @@ async def handle_content(message: Message, ctx: AppContext) -> None:
         return
 
     chat_id = message.chat.id
+
+    # ответ (реплай) на присланный материал = правки к нему
+    session = ctx.sessions.get(chat_id)
+    reply = message.reply_to_message
+    if session and reply and reply.message_id in session.message_map:
+        await _handle_feedback(ctx, message, session.message_map[reply.message_id])
+        return
+
     series = ctx.series.get(chat_id)
     is_new_series = series is None
     if series is None:
@@ -305,10 +440,33 @@ async def handle_content(message: Message, ctx: AppContext) -> None:
 
     if is_new_series:
         series.status_message = await message.answer(
-            STATUS_TEXT, reply_markup=collect_keyboard
+            STATUS_TEXT, reply_markup=series_keyboard()
         )
 
     _schedule_run(ctx, series)
+
+
+@router.callback_query(F.data.in_(CHANNEL_CHOICES))
+async def handle_channel_choice(callback: CallbackQuery, ctx: AppContext) -> None:
+    if not ctx.is_allowed(callback.from_user.id):
+        await callback.answer()
+        return
+    channels = CHANNEL_CHOICES[callback.data]
+    labels = ", ".join(CHANNEL_LABELS[ch] for ch in channels)
+
+    series = ctx.series.get(callback.message.chat.id) if callback.message else None
+    if series is None:
+        await callback.answer("Серия уже собрана - выбор применится к следующей идее")
+        return
+    series.channels = channels
+    await callback.answer(f"Каналы: {labels}")
+    try:
+        await callback.message.edit_text(
+            f"Слушаю, шлите ещё или нажмите Собрать бриф.\nКаналы: {labels}.",
+            reply_markup=series_keyboard(),
+        )
+    except TelegramBadRequest:
+        pass
 
 
 @router.callback_query(F.data == COLLECT_CALLBACK)

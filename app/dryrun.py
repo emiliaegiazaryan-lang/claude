@@ -2,6 +2,7 @@
 
 Использование:
     python -m app.dryrun "текст темы"
+    python -m app.dryrun "текст темы" --channels telegram,vcru
 
 Нужен только ANTHROPIC_API_KEY в .env - транскрибация и Telegram не задействованы.
 """
@@ -10,19 +11,19 @@ import asyncio
 import logging
 import sys
 
-from .agents import AgentRunner
+from .agents import CHANNEL_ORDER, AgentRunner
 from .config import load_settings, require
 from .pipeline import run_pipeline
 
 SEPARATOR = "=" * 70
 
 
-async def _main(topic: str) -> None:
+async def _main(topic: str, channels: tuple[str, ...] | None) -> None:
     settings = load_settings()
     require(settings, "anthropic_api_key")
     runner = AgentRunner(settings)
 
-    result = await run_pipeline(runner, topic)
+    result = await run_pipeline(runner, topic, channels)
 
     print(SEPARATOR)
     print("МАСТЕР-БРИФ")
@@ -62,11 +63,23 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    topic = " ".join(sys.argv[1:]).strip()
+    args = sys.argv[1:]
+    channels: tuple[str, ...] | None = None
+    if "--channels" in args:
+        i = args.index("--channels")
+        raw = args[i + 1] if i + 1 < len(args) else ""
+        channels = tuple(ch.strip() for ch in raw.split(",") if ch.strip())
+        unknown = [ch for ch in channels if ch not in CHANNEL_ORDER]
+        if unknown or not channels:
+            print(f"Неизвестные каналы: {', '.join(unknown) or '(пусто)'}. "
+                  f"Доступны: {', '.join(CHANNEL_ORDER)}")
+            sys.exit(1)
+        args = args[:i] + args[i + 2:]
+    topic = " ".join(args).strip()
     if not topic:
-        print('Использование: python -m app.dryrun "текст темы"')
+        print('Использование: python -m app.dryrun "текст темы" [--channels telegram,vcru]')
         sys.exit(1)
-    asyncio.run(_main(topic))
+    asyncio.run(_main(topic, channels))
 
 
 if __name__ == "__main__":

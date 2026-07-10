@@ -19,6 +19,7 @@ class ChannelMaterial:
     label: str
     title: str | None
     body: str
+    raw: str = ""  # текст после чистки, до разбора - основа для правок
     posts: list[str] = field(default_factory=list)  # только для Threads
     editor_status: str = "OK"
     editor_issues: str = ""
@@ -85,12 +86,33 @@ def split_threads_posts(text: str) -> list[str]:
     return cleaned
 
 
-async def run_pipeline(runner: AgentRunner, source_text: str) -> PipelineResult:
+def make_material(channel: str, cleaned_text: str, verdict) -> ChannelMaterial:
+    title, body = split_title(channel, cleaned_text)
+    posts = split_threads_posts(body) if channel == "threads" else []
+    return ChannelMaterial(
+        channel=channel,
+        label=CHANNEL_LABELS[channel],
+        title=title,
+        body=body,
+        raw=cleaned_text,
+        posts=posts,
+        editor_status=verdict.status,
+        editor_issues=verdict.issues,
+    )
+
+
+async def run_pipeline(
+    runner: AgentRunner,
+    source_text: str,
+    channels: tuple[str, ...] | None = None,
+) -> PipelineResult:
+    selected = tuple(channels) if channels else CHANNEL_ORDER
+
     brief = await runner.build_brief(source_text)
 
-    logger.info("Запускаю %d канальных агента параллельно", len(CHANNEL_ORDER))
+    logger.info("Запускаю канальных агентов параллельно: %s", ", ".join(selected))
     drafts = await asyncio.gather(
-        *(runner.write_channel(channel, brief) for channel in CHANNEL_ORDER)
+        *(runner.write_channel(channel, brief) for channel in selected)
     )
 
     # механическая чистка до редактора: тире, восклицания, эмодзи
@@ -101,25 +123,28 @@ async def run_pipeline(runner: AgentRunner, source_text: str) -> PipelineResult:
     verdicts = await asyncio.gather(
         *(
             runner.review(channel, brief, text)
-            for channel, text in zip(CHANNEL_ORDER, cleaned)
+            for channel, text in zip(selected, cleaned)
         )
     )
 
-    materials = []
-    for channel, text, verdict in zip(CHANNEL_ORDER, cleaned, verdicts):
-        title, body = split_title(channel, text)
-        posts = split_threads_posts(body) if channel == "threads" else []
-        materials.append(
-            ChannelMaterial(
-                channel=channel,
-                label=CHANNEL_LABELS[channel],
-                title=title,
-                body=body,
-                posts=posts,
-                editor_status=verdict.status,
-                editor_issues=verdict.issues,
-            )
-        )
+    materials = [
+        make_material(channel, text, verdict)
+        for channel, text, verdict in zip(selected, cleaned, verdicts)
+    ]
 
-    logger.info("Пайплайн завершён: %d текста готовы", len(materials))
+    logger.info("Пайплайн завершён: %d текст(а) готовы", len(materials))
     return PipelineResult(brief=brief, gaps=extract_gaps(brief), materials=materials)
+
+
+async def revise_material(
+    runner: AgentRunner,
+    channel: str,
+    brief: str,
+    current_text: str,
+    feedback: str,
+) -> ChannelMaterial:
+    """Переделывает один материал по правкам автора: агент -> чистка -> редактор."""
+    revised = await runner.revise_channel(channel, brief, current_text, feedback)
+    cleaned = mechanical_cleanup(revised)
+    verdict = await runner.review(channel, brief, cleaned)
+    return make_material(channel, cleaned, verdict)

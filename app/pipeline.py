@@ -61,6 +61,8 @@ def split_title(channel: str, text: str) -> tuple[str | None, str]:
             continue
         body_lines.append(line)
     body = "\n".join(body_lines).strip()
+    # модель иногда ставит строку-разделитель --- сразу после заголовка
+    body = re.sub(r"\A-{3,}\s*\n", "", body).strip()
     return title, body or text
 
 

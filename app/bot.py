@@ -210,9 +210,9 @@ async def _send_telegram_material(ctx: AppContext, chat_id: int, material: Chann
 async def _send_vcru_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:
     lines = [material.label, ""]
     if material.title:
-        lines += [f"Заголовок: {material.title}", ""]
-    lines.append(material.body)
-    await send_long(ctx.bot, chat_id, "\n".join(lines))
+        lines += [f"Заголовок: {sanitize_telegram_html(material.title)}", ""]
+    lines.append(sanitize_telegram_html(material.body))
+    await send_telegram_html(ctx.bot, chat_id, "\n".join(lines))
 
 
 async def _send_threads_material(ctx: AppContext, chat_id: int, material: ChannelMaterial) -> None:

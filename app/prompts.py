@@ -16,7 +16,7 @@ PROMPT_COMPOSITION: dict[str, tuple[str, ...]] = {
     "parser": ("parser",),
     "editor": ("editor",),
     "telegram": ("style_card", "etalons_telegram", "telegram"),
-    "vcru": ("style_card", "format_vcru", "etalons_vcru", "vcru"),
+    "vcru": ("style_card", "format_vcru", "etalons_vcru", "vcru", "vcru_html"),
     "threads": ("style_card", "threads"),
 }
 

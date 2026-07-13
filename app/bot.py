@@ -28,7 +28,13 @@ from aiogram.types import (
 
 from .agents import CHANNEL_LABELS, CHANNEL_ORDER, AgentRunner
 from .config import Settings, load_settings, require
-from .pipeline import ChannelMaterial, PipelineResult, revise_material, run_pipeline
+from .pipeline import (
+    ChannelMaterial,
+    PipelineResult,
+    generate_channels,
+    revise_material,
+    run_pipeline,
+)
 from .transcription import Transcriber
 
 logger = logging.getLogger(__name__)
@@ -46,6 +52,15 @@ CHANNEL_CHOICES: dict[str, tuple[str, ...]] = {
     "ch_all": CHANNEL_ORDER,
 }
 
+# те же варианты для догенерации из уже собранного брифа
+MORE_CHOICES: dict[str, tuple[str, ...]] = {
+    "more_telegram": ("telegram",),
+    "more_vcru": ("vcru",),
+    "more_threads": ("threads",),
+    "more_tg_vc": ("telegram", "vcru"),
+    "more_all": CHANNEL_ORDER,
+}
+
 MAX_MESSAGE_LENGTH = 4000
 
 STATUS_TEXT = (
@@ -55,8 +70,25 @@ STATUS_TEXT = (
 PROCESSING_TEXT = "Принял. Собираю бриф и тексты, обычно это занимает 1-2 минуты..."
 FEEDBACK_HINT = (
     "Если что-то не нравится - ответьте (реплаем) на нужный материал "
-    "и напишите или наговорите правки."
+    "и напишите или наговорите правки.\n"
+    "Сгенерировать из этой же идеи другие каналы - кнопки ниже."
 )
+
+
+def more_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Telegram", callback_data="more_telegram"),
+                InlineKeyboardButton(text="vc.ru", callback_data="more_vcru"),
+                InlineKeyboardButton(text="Threads", callback_data="more_threads"),
+            ],
+            [
+                InlineKeyboardButton(text="Telegram + vc.ru", callback_data="more_tg_vc"),
+                InlineKeyboardButton(text="Все три", callback_data="more_all"),
+            ],
+        ]
+    )
 
 
 def series_keyboard() -> InlineKeyboardMarkup:
@@ -348,7 +380,7 @@ async def _send_result(ctx: AppContext, chat_id: int, result: PipelineResult) ->
     if result.gaps:
         await send_long(ctx.bot, chat_id, "Проверь перед публикацией:\n\n" + result.gaps)
 
-    await ctx.bot.send_message(chat_id, FEEDBACK_HINT)
+    await ctx.bot.send_message(chat_id, FEEDBACK_HINT, reply_markup=more_keyboard())
 
 
 async def _handle_feedback(ctx: AppContext, message: Message, channel: str) -> None:
@@ -382,6 +414,9 @@ async def _handle_feedback(ctx: AppContext, message: Message, channel: str) -> N
     except TelegramBadRequest:
         pass
     await _send_material(ctx, message.chat.id, material, session)
+    await ctx.bot.send_message(
+        message.chat.id, FEEDBACK_HINT, reply_markup=more_keyboard()
+    )
 
 
 @router.message(CommandStart())
@@ -467,6 +502,45 @@ async def handle_channel_choice(callback: CallbackQuery, ctx: AppContext) -> Non
         )
     except TelegramBadRequest:
         pass
+
+
+@router.callback_query(F.data.in_(MORE_CHOICES))
+async def handle_more(callback: CallbackQuery, ctx: AppContext) -> None:
+    """Догенерация каналов из уже собранного брифа - без повторного парсинга."""
+    if not ctx.is_allowed(callback.from_user.id):
+        await callback.answer()
+        return
+    if not callback.message:
+        await callback.answer()
+        return
+
+    chat_id = callback.message.chat.id
+    session = ctx.sessions.get(chat_id)
+    if session is None:
+        await callback.answer("Идея не найдена - пришлите её заново", show_alert=True)
+        return
+
+    channels = MORE_CHOICES[callback.data]
+    labels = ", ".join(CHANNEL_LABELS[ch] for ch in channels)
+    await callback.answer(f"Генерирую: {labels}")
+    note = await ctx.bot.send_message(chat_id, f"Генерирую {labels} из той же идеи...")
+
+    try:
+        materials = await generate_channels(ctx.runner, session.brief, channels)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Догенерация упала")
+        await ctx.bot.send_message(
+            chat_id, f"Не получилось сгенерировать: {exc}. Попробуйте ещё раз."
+        )
+        return
+
+    try:
+        await note.delete()
+    except TelegramBadRequest:
+        pass
+    for material in materials:
+        await _send_material(ctx, chat_id, material, session)
+    await ctx.bot.send_message(chat_id, FEEDBACK_HINT, reply_markup=more_keyboard())
 
 
 @router.callback_query(F.data == COLLECT_CALLBACK)

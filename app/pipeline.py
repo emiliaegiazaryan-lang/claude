@@ -101,18 +101,16 @@ def make_material(channel: str, cleaned_text: str, verdict) -> ChannelMaterial:
     )
 
 
-async def run_pipeline(
+async def generate_channels(
     runner: AgentRunner,
-    source_text: str,
-    channels: tuple[str, ...] | None = None,
-) -> PipelineResult:
-    selected = tuple(channels) if channels else CHANNEL_ORDER
-
-    brief = await runner.build_brief(source_text)
-
-    logger.info("Запускаю канальных агентов параллельно: %s", ", ".join(selected))
+    brief: str,
+    channels: tuple[str, ...],
+) -> list[ChannelMaterial]:
+    """Генерирует тексты выбранных каналов из готового брифа:
+    агенты параллельно -> механическая чистка -> редактор."""
+    logger.info("Запускаю канальных агентов параллельно: %s", ", ".join(channels))
     drafts = await asyncio.gather(
-        *(runner.write_channel(channel, brief) for channel in selected)
+        *(runner.write_channel(channel, brief) for channel in channels)
     )
 
     # механическая чистка до редактора: тире, восклицания, эмодзи
@@ -123,14 +121,25 @@ async def run_pipeline(
     verdicts = await asyncio.gather(
         *(
             runner.review(channel, brief, text)
-            for channel, text in zip(selected, cleaned)
+            for channel, text in zip(channels, cleaned)
         )
     )
 
-    materials = [
+    return [
         make_material(channel, text, verdict)
-        for channel, text, verdict in zip(selected, cleaned, verdicts)
+        for channel, text, verdict in zip(channels, cleaned, verdicts)
     ]
+
+
+async def run_pipeline(
+    runner: AgentRunner,
+    source_text: str,
+    channels: tuple[str, ...] | None = None,
+) -> PipelineResult:
+    selected = tuple(channels) if channels else CHANNEL_ORDER
+
+    brief = await runner.build_brief(source_text)
+    materials = await generate_channels(runner, brief, selected)
 
     logger.info("Пайплайн завершён: %d текст(а) готовы", len(materials))
     return PipelineResult(brief=brief, gaps=extract_gaps(brief), materials=materials)

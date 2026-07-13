@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 
 import anthropic
+import httpx
 
 from .config import Settings
 from .prompts import build_system_prompt
@@ -40,9 +41,12 @@ class AgentRunner:
     def __init__(self, settings: Settings):
         self._settings = settings
         # SDK сам ретраит 429/5xx и сетевые ошибки с экспоненциальным бэкоффом.
+        # connect=10: если API недоступен (например, российский IP без VPN),
+        # ошибка всплывает за секунды, а не висит десятки минут.
         self._client = anthropic.AsyncAnthropic(
             api_key=settings.anthropic_api_key,
             max_retries=3,
+            timeout=httpx.Timeout(180.0, connect=10.0),
         )
 
     async def _call(

@@ -2,6 +2,7 @@
 
 import logging
 
+import httpx
 from openai import AsyncOpenAI
 
 from .config import Settings
@@ -12,7 +13,12 @@ logger = logging.getLogger(__name__)
 class Transcriber:
     def __init__(self, settings: Settings):
         # SDK сам ретраит 429/5xx и сетевые ошибки с экспоненциальным бэкоффом.
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key, max_retries=3)
+        # connect=10: при недоступном API ошибка всплывает быстро, а не висит.
+        self._client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            max_retries=3,
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        )
 
     async def transcribe(self, audio_bytes: bytes, filename: str = "voice.ogg") -> str:
         result = await self._client.audio.transcriptions.create(

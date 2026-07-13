@@ -479,6 +479,50 @@ async def handle_collect(callback: CallbackQuery, ctx: AppContext) -> None:
         await _run_series(ctx, callback.message.chat.id)
 
 
+async def check_api_access(settings: Settings) -> None:
+    """Быстрая проверка доступности API при старте - чтобы проблема с сетью
+    была видна сразу, а не молчанием после первого голосового."""
+    import anthropic
+    import httpx
+    from openai import AsyncOpenAI
+
+    anthropic_client = anthropic.AsyncAnthropic(
+        api_key=settings.anthropic_api_key, max_retries=0, timeout=15.0
+    )
+    try:
+        await anthropic_client.models.retrieve(settings.model)
+        logger.info("Anthropic API доступен, модель %s на месте", settings.model)
+    except anthropic.AuthenticationError as exc:
+        raise SystemExit(f"Ключ ANTHROPIC_API_KEY не подходит: {exc}") from exc
+    except (anthropic.APIConnectionError, httpx.HTTPError) as exc:
+        raise SystemExit(
+            "Anthropic API недоступен с этого компьютера. "
+            "Он не работает с российских IP: включите VPN и перезапустите бота, "
+            "или разместите бота на зарубежном хостинге (Railway - инструкция в README). "
+            f"Ошибка: {exc}"
+        ) from exc
+    except anthropic.PermissionDeniedError as exc:
+        raise SystemExit(
+            "Anthropic API отказал в доступе - похоже, запрос идёт с российского IP. "
+            "Включите VPN и перезапустите бота, или разместите бота на зарубежном "
+            f"хостинге (Railway - инструкция в README). Ошибка: {exc}"
+        ) from exc
+
+    openai_client = AsyncOpenAI(
+        api_key=settings.openai_api_key, max_retries=0, timeout=15.0
+    )
+    try:
+        await openai_client.models.retrieve("whisper-1")
+        logger.info("OpenAI API доступен, whisper-1 на месте")
+    except Exception as exc:  # noqa: BLE001 - без транскрибации бот частично работает
+        logger.warning(
+            "OpenAI API недоступен (%s). Голосовые распознаваться не будут, "
+            "текстовые сообщения продолжат работать. Причина обычно та же - "
+            "нужен VPN или зарубежный хостинг.",
+            exc,
+        )
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -486,6 +530,8 @@ async def main() -> None:
     )
     settings = load_settings()
     require(settings, "telegram_bot_token", "anthropic_api_key", "openai_api_key")
+
+    await check_api_access(settings)
 
     bot = Bot(token=settings.telegram_bot_token)
     dp = Dispatcher()

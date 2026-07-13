@@ -37,6 +37,7 @@ class PipelineResult:
     brief: str
     gaps: str | None
     materials: list[ChannelMaterial]
+    research: str | None = None  # находки факт-чекера по пробелам (не проверено)
 
 
 def extract_gaps(brief: str) -> str | None:
@@ -139,10 +140,27 @@ async def run_pipeline(
     selected = tuple(channels) if channels else CHANNEL_ORDER
 
     brief = await runner.build_brief(source_text)
+    gaps = extract_gaps(brief)
+
+    # факт-чекер ищет по пробелам параллельно с написанием текстов -
+    # выдача не замедляется; его сбой не роняет пайплайн
+    research_task = (
+        asyncio.create_task(runner.research_gaps(gaps)) if gaps else None
+    )
+
     materials = await generate_channels(runner, brief, selected)
 
+    research = None
+    if research_task:
+        try:
+            research = await research_task
+        except Exception:  # noqa: BLE001
+            logger.exception("Факт-чекер упал - продолжаю без находок")
+
     logger.info("Пайплайн завершён: %d текст(а) готовы", len(materials))
-    return PipelineResult(brief=brief, gaps=extract_gaps(brief), materials=materials)
+    return PipelineResult(
+        brief=brief, gaps=gaps, materials=materials, research=research
+    )
 
 
 async def revise_material(

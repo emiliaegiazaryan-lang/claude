@@ -378,7 +378,13 @@ async def _send_result(ctx: AppContext, chat_id: int, result: PipelineResult) ->
         await _send_material(ctx, chat_id, material, session)
 
     if result.gaps:
-        await send_long(ctx.bot, chat_id, "Проверь перед публикацией:\n\n" + result.gaps)
+        text = "Проверь перед публикацией:\n\n" + result.gaps
+        if result.research:
+            text += (
+                "\n\nЧто нашлось в интернете по пробелам "
+                "(кандидаты для проверки, не подтверждено):\n\n" + result.research
+            )
+        await send_long(ctx.bot, chat_id, text)
 
     await ctx.bot.send_message(chat_id, FEEDBACK_HINT, reply_markup=more_keyboard())
 

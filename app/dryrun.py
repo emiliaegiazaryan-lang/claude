@@ -36,6 +36,10 @@ async def _main(topic: str, channels: tuple[str, ...] | None) -> None:
         print("ПРОБЕЛЫ - проверь перед публикацией")
         print(SEPARATOR)
         print(result.gaps)
+        if result.research:
+            print()
+            print("Что нашлось в интернете (кандидаты, не подтверждено):")
+            print(result.research)
 
     for material in result.materials:
         print()
